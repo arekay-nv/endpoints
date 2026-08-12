@@ -53,6 +53,93 @@ from .generate import generate_dataset
 logger = logging.getLogger(__name__)
 
 
+def _truncate(value: object, max_len: int) -> str:
+    """Stringify and cap ``value`` to ``max_len`` chars (test cases can be MB-sized)."""
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + f"...(+{len(text) - max_len} chars truncated)"
+
+
+def _derive_lcb_status(code: str, res: list, metadata: dict) -> str:
+    """Human-readable outcome from LCB per-test results + metadata error codes.
+
+    LCB encodes each test as >0 pass / 0 (or False) wrong-answer / negative error
+    code; ``metadata`` carries an ``error_code`` for whole-run failures (-1 timeout,
+    -5 test-runner error). See run_lcb_tests / compute_code_generation_metrics.
+    """
+    if not (code or "").strip():
+        return "empty_code"
+    if res and all(r > 0 for r in res):
+        return "passed"
+    error_code = metadata.get("error_code") if isinstance(metadata, dict) else None
+    negatives = [r for r in res if isinstance(r, (int, float)) and r < 0]
+    if error_code == -1 or -1 in negatives:
+        return "timeout"
+    if error_code == -5:
+        return "test_runner_error"
+    if negatives:
+        return "runtime_error"
+    return "wrong_answer"
+
+
+def _build_execution_record(
+    question_id: str,
+    code_index: int,
+    code: str,
+    test_suite_json: str,
+    res: list,
+    metadata: dict,
+    passed: bool,
+    full: bool,
+    max_field: int,
+) -> dict:
+    """One per-sample execution-log record: code, test cases, and per-test results.
+
+    ``full=False`` truncates each test-case input/output and the error trace to
+    ``max_field`` chars — LCB private test cases can be megabytes per problem.
+    """
+    metadata = metadata if isinstance(metadata, dict) else {}
+    try:
+        suite = json.loads(test_suite_json)
+        inputs, outputs = suite.get("inputs", []), suite.get("outputs", [])
+        if full:
+            test_cases: dict = {
+                "num": len(inputs),
+                "inputs": inputs,
+                "expected_outputs": outputs,
+            }
+        else:
+            test_cases = {
+                "num": len(inputs),
+                "truncated_per_field_chars": max_field,
+                "inputs": [_truncate(x, max_field) for x in inputs],
+                "expected_outputs": [_truncate(x, max_field) for x in outputs],
+            }
+    except (ValueError, TypeError):
+        test_cases = {"raw": _truncate(test_suite_json, max_field)}
+    n_passed = sum(1 for r in res if isinstance(r, (int, float)) and r > 0)
+    error_trace = metadata.get("error")
+    return {
+        "question_id": question_id,
+        "code_index": code_index,
+        "passed": bool(passed),
+        "status": _derive_lcb_status(code, res, metadata),
+        "num_test_cases": len(res),
+        "num_passed_test_cases": n_passed,
+        "per_test_results": res,
+        "error_code": metadata.get("error_code"),
+        "error_message": metadata.get("error_message"),
+        "error_trace": (
+            (error_trace if full else _truncate(error_trace, max_field))
+            if error_trace
+            else None
+        ),
+        "code": code,
+        "test_cases": test_cases,
+    }
+
+
 def execute_code_single(test_suite_json: str, code: str, timeout_sec: int = 60):
     # Run code with lcb_runner. Note that the lcb_runner has a very rudimentary sandbox
     # which is extremely easy to bypass, and as such it is recommended to run this both
@@ -243,10 +330,16 @@ class _LCBWorker:
         test_loader: LCBTestLoader,
         n_lcb_workers: int = 1,
         worker_timeout_sec: int = 60,
+        execution_log_path: Path | None = None,
+        execution_log_full: bool = False,
+        execution_log_max_field: int = 2000,
     ):
         self.test_loader = test_loader
         self.n_lcb_workers = n_lcb_workers
         self.worker_timeout_sec = worker_timeout_sec
+        self.execution_log_path = execution_log_path
+        self.execution_log_full = execution_log_full
+        self.execution_log_max_field = execution_log_max_field
 
     def __call__(
         self,
@@ -267,55 +360,82 @@ class _LCBWorker:
         """
         # Create results dict with the expected size
         results: dict[str, list[bool]] = {}
+        codes_by_qid: dict[str, list[str]] = {}
         for qid, test_codes in zip(question_ids, codes, strict=False):
             results[qid] = [False] * len(test_codes)
+            codes_by_qid[qid] = test_codes
         futures = {}
 
-        with ProcessPoolExecutor(max_workers=self.n_lcb_workers) as executor:
-            for qid, test_codes in zip(question_ids, codes, strict=False):
-                test_suite_json = self.test_loader[qid]
-                for i, code in enumerate(test_codes):
-                    future = executor.submit(
-                        run_code_subprocess,
-                        test_suite_json,
-                        code,
-                        timeout_sec=self.worker_timeout_sec,
-                    )
+        log_fh = None
+        if self.execution_log_path is not None:
+            self.execution_log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_fh = self.execution_log_path.open("w")
 
-                    # Note that futures are hashable for bookkeeping purposes.
-                    futures[future] = (qid, i)
-
-            # Gather results as they complete
-            for future in as_completed(futures):
-                qid, code_idx = futures[future]
-                res, metadata = future.result()
-                if "error" in metadata:
-                    logger.warning(
-                        f"Test execution error for question {qid}: {metadata}"
-                    )
-
-                # LCB uses any result > 0 as a 'pass' since:
-                # Negative numbers indicate error codes
-                # 0 is False casted to an int
-                # 1 is True casted to an int
-                # For a generalized pass@k score, it should be grouped by question_id
-                # `res` is a list of results for each test case in the problem, and for
-                # a given code sample to be considered passing, all test cases must pass.
-                results[qid][code_idx] = all(case_result > 0 for case_result in res)
-
-                # For now we discard metadata since we only care about overall score.
-                # In the future, for debugging purposes, we can log the metadata to see
-                # reasons for failures if results are not as expected.
-                if on_problem_complete is not None:
-                    # Callback should not impede or interrupt execution
-                    try:
-                        on_problem_complete([qid])
-                    except Exception as e:
-                        logger.error(
-                            "Error occurred during on_problem_complete callback: %r",
-                            e,
-                            exc_info=True,
+        try:
+            with ProcessPoolExecutor(max_workers=self.n_lcb_workers) as executor:
+                for qid, test_codes in zip(question_ids, codes, strict=False):
+                    test_suite_json = self.test_loader[qid]
+                    for i, code in enumerate(test_codes):
+                        future = executor.submit(
+                            run_code_subprocess,
+                            test_suite_json,
+                            code,
+                            timeout_sec=self.worker_timeout_sec,
                         )
+
+                        # Note that futures are hashable for bookkeeping purposes.
+                        futures[future] = (qid, i)
+
+                # Gather results as they complete
+                for future in as_completed(futures):
+                    qid, code_idx = futures[future]
+                    res, metadata = future.result()
+                    if "error" in metadata:
+                        logger.warning(
+                            f"Test execution error for question {qid}: {metadata}"
+                        )
+
+                    # LCB uses any result > 0 as a 'pass' since:
+                    # Negative numbers indicate error codes
+                    # 0 is False casted to an int
+                    # 1 is True casted to an int
+                    # For a generalized pass@k score, it should be grouped by question_id
+                    # `res` is a list of results for each test case in the problem, and for
+                    # a given code sample to be considered passing, all test cases must pass.
+                    passed = all(case_result > 0 for case_result in res)
+                    results[qid][code_idx] = passed
+
+                    # Per-sample execution log (code + test cases + per-test results +
+                    # error metadata) when enabled; otherwise metadata is discarded and
+                    # only the pass/fail bool above is kept.
+                    if log_fh is not None:
+                        record = _build_execution_record(
+                            qid,
+                            code_idx,
+                            codes_by_qid[qid][code_idx],
+                            self.test_loader[qid],
+                            res,
+                            metadata,
+                            passed,
+                            self.execution_log_full,
+                            self.execution_log_max_field,
+                        )
+                        log_fh.write(json.dumps(record) + "\n")
+                        log_fh.flush()
+
+                    if on_problem_complete is not None:
+                        # Callback should not impede or interrupt execution
+                        try:
+                            on_problem_complete([qid])
+                        except Exception as e:
+                            logger.error(
+                                "Error occurred during on_problem_complete callback: %r",
+                                e,
+                                exc_info=True,
+                            )
+        finally:
+            if log_fh is not None:
+                log_fh.close()
 
         return results
 
@@ -391,6 +511,9 @@ class LCBServe:
         codes_dict: dict[str, list[str]],
         timeout_sec: int = 60,
         on_problem_complete: Callable[[list[str]], None] | None = None,
+        execution_log_path: Path | None = None,
+        execution_log_full: bool = False,
+        execution_log_max_field: int = 2000,
     ) -> dict[str, list[bool]]:
         """Evaluates LiveCodeBench problems given question IDs and their corresponding code samples.
 
@@ -431,6 +554,9 @@ class LCBServe:
             self.test_loader,
             n_lcb_workers=self.n_workers,
             worker_timeout_sec=timeout_sec,
+            execution_log_path=execution_log_path,
+            execution_log_full=execution_log_full,
+            execution_log_max_field=execution_log_max_field,
         )
         return worker(qids, codes, on_problem_complete=on_problem_complete)
 
@@ -439,6 +565,9 @@ class LCBServe:
         df: pd.DataFrame,
         timeout_sec: int = 60,
         on_problem_complete: Callable[[list[str]], None] | None = None,
+        execution_log_path: Path | None = None,
+        execution_log_full: bool = False,
+        execution_log_max_field: int = 2000,
     ) -> dict[str, int | float]:
         """Evaluates all LiveCodeBench problems in a parquet file and returns a dictionary in the form:
         {
@@ -474,6 +603,9 @@ class LCBServe:
             codes_dict=codes_dict,
             timeout_sec=timeout_sec,
             on_problem_complete=on_problem_complete,
+            execution_log_path=execution_log_path,
+            execution_log_full=execution_log_full,
+            execution_log_max_field=execution_log_max_field,
         )
 
         # Count number of passed samples. Note values are lists of booleans, so we can sum them directly.
@@ -517,6 +649,26 @@ if __name__ == "__main__":
         default=60,
         help="Timeout in seconds for each test case (default: 60)",
     )
+    parser.add_argument(
+        "--execution-log",
+        type=Path,
+        default=None,
+        help="If set, write one JSONL record per (question_id, code_index) with the "
+        "executed code, test cases, per-test results, and error code/status.",
+    )
+    parser.add_argument(
+        "--execution-log-full",
+        action="store_true",
+        help="Do not truncate test-case inputs/outputs or error traces in the "
+        "execution log (LCB private test cases can be MB-sized per problem).",
+    )
+    parser.add_argument(
+        "--execution-log-max-field",
+        type=int,
+        default=2000,
+        help="Per-field truncation length (chars) for the execution log unless "
+        "--execution-log-full is set (default: 2000).",
+    )
 
     args = parser.parse_args()
 
@@ -536,6 +688,9 @@ if __name__ == "__main__":
             df=df,
             timeout_sec=args.timeout,
             on_problem_complete=lambda x: pbar.update(len(x)),
+            execution_log_path=args.execution_log,
+            execution_log_full=args.execution_log_full,
+            execution_log_max_field=args.execution_log_max_field,
         )
 
     print(json.dumps(results))
