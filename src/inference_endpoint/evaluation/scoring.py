@@ -418,6 +418,33 @@ def _uv_subproject_env(project_path: os.PathLike | str) -> dict[str, str]:
     return {**os.environ, "UV_PROJECT_ENVIRONMENT": str(Path(project_path) / ".venv")}
 
 
+def _dump_lcb_codes(
+    dump_dir: str, url: str, codes_dict: dict[str, list[str]], timeout_sec: int
+) -> None:
+    """Persist the exact codes_dict payload for offline re-grading.
+
+    Gated by ``LCB_DUMP_CODES_DIR``. Writes the same payload sent to the
+    container so it can be replayed verbatim against a different lcb-service
+    build (e.g. a Python 3.11 vs 3.14 A/B) with no re-inference and no
+    reconstruction from events. Files are numbered so multiple evaluate calls
+    in one run do not clobber each other.
+    """
+    d = Path(dump_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    idx = len(list(d.glob("codes_*.json")))
+    path = d / f"codes_{idx:03d}.json"
+    payload = {"url": url, "timeout_sec": timeout_sec, "codes_dict": codes_dict}
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(path)
+    logger.info(
+        "LCB_DUMP_CODES_DIR: wrote %s (%d problems, %d samples)",
+        path,
+        len(codes_dict),
+        sum(len(c) for c in codes_dict.values()),
+    )
+
+
 def _lcb_ws_evaluate(
     url: str, codes_dict: dict[str, list[str]], timeout_sec: int
 ) -> dict | None:
@@ -429,6 +456,9 @@ def _lcb_ws_evaluate(
     a module function so both LiveCodeBenchScorer and LegacyMLPerfDeepSeekR1Scorer (which
     grades its livecodebench subset out-of-band) share one client.
     """
+    dump_dir = os.environ.get("LCB_DUMP_CODES_DIR")
+    if dump_dir:
+        _dump_lcb_codes(dump_dir, url, codes_dict, timeout_sec)
     if websocket is None:
         logger.warning(
             "websocket-client not installed; cannot reach lcb-service. "

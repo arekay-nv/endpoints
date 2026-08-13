@@ -1,7 +1,14 @@
 # syntax=docker/dockerfile:1
 
+# Python interpreter for the LCB code-execution sandbox. LCB is an execution
+# benchmark, so this interpreter version is the environment the candidate
+# solutions run under. Exposed as a build ARG so one Dockerfile produces the
+# 3.11 and 3.14 variants (override with --build-arg PYTHON_VERSION=3.14).
+ARG PYTHON_VERSION=3.11
+ARG DHI_DISTRO=debian13
+
 ## -----------------------------------------------------
-FROM dhi.io/python:3.14-debian13-sfw-dev AS build-stage
+FROM dhi.io/python:${PYTHON_VERSION}-${DHI_DISTRO}-sfw-dev AS build-stage
 
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -23,16 +30,23 @@ RUN mkdir -p /opt/LiveCodeBench_Datasets/release_v6
 
 COPY generate.py /opt/LiveCodeBench_Datasets/generate.py
 
+# BAKE_DATASET=0 skips the ~9GB dataset bake so the image stays small (~1GB);
+# the dataset is then mounted read-only over /opt/LiveCodeBench_Datasets at
+# runtime. BAKE_DATASET=1 (default) bakes release_v6 into the image as before.
+ARG BAKE_DATASET=1
 RUN --mount=type=secret,id=HF_TOKEN,dst=/run/secrets/hf_token \
-    export HF_TOKEN=$(cat /run/secrets/hf_token) \
-    && python /opt/LiveCodeBench_Datasets/generate.py \
-        --datasets-dir /opt/LiveCodeBench_Datasets \
-        --variant release_v6
-RUN chmod 444 -R /opt/LiveCodeBench_Datasets/*
-RUN chmod 555 /opt/LiveCodeBench_Datasets
+    if [ "${BAKE_DATASET}" = "1" ]; then \
+        export HF_TOKEN=$(cat /run/secrets/hf_token) && \
+        python /opt/LiveCodeBench_Datasets/generate.py \
+            --datasets-dir /opt/LiveCodeBench_Datasets \
+            --variant release_v6; \
+    else \
+        echo "BAKE_DATASET=0: skipping dataset bake (mount at runtime)"; \
+    fi
+RUN chmod 444 -R /opt/LiveCodeBench_Datasets/* && chmod 555 /opt/LiveCodeBench_Datasets
 
 ## -----------------------------------------------------
-FROM dhi.io/python:3.14-debian13 AS runtime-stage
+FROM dhi.io/python:${PYTHON_VERSION}-${DHI_DISTRO} AS runtime-stage
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
